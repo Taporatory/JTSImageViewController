@@ -22,7 +22,6 @@
 
 typedef NS_ENUM(NSInteger, JTSImageViewControllerMode) {
     JTSImageViewControllerMode_Image,
-    JTSImageViewControllerMode_AltText,
 };
 
 typedef NS_ENUM(NSInteger, JTSImageViewControllerTransition) {
@@ -47,7 +46,8 @@ extern CGFloat const JTSImageViewController_DefaultBackgroundBlurRadius;
 
 @property (strong, nonatomic, readonly) JTSImageInfo *imageInfo;
 
-@property (strong, nonatomic, readonly) UIImage *image;
+@property (nonatomic, weak) UIScrollView *scrollView;
+@property (nonatomic, weak) UIImageView *imageView;
 
 @property (assign, nonatomic, readonly) JTSImageViewControllerMode mode;
 

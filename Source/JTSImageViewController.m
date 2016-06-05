@@ -58,7 +58,6 @@ typedef struct {
     BOOL scrollViewIsAnimatingAZoom;
     BOOL imageIsBeingReadFromDisk;
     BOOL isManuallyResizingTheScrollViewFrame;
-    BOOL imageDownloadFailed;
 } JTSImageViewControllerFlags;
 
 #define USE_DEBUG_SLOW_ANIMATIONS 0
@@ -70,14 +69,12 @@ typedef struct {
 @interface JTSImageViewController ()
 <
     UIScrollViewDelegate,
-    UITextViewDelegate,
     UIViewControllerTransitioningDelegate,
     UIGestureRecognizerDelegate
 >
 
 // General Info
 @property (strong, nonatomic, readwrite) JTSImageInfo *imageInfo;
-@property (strong, nonatomic, readwrite) UIImage *image;
 @property (assign, nonatomic, readwrite) JTSImageViewControllerTransition transition;
 @property (assign, nonatomic, readwrite) JTSImageViewControllerMode mode;
 @property (assign, nonatomic, readwrite) JTSImageViewControllerBackgroundOptions backgroundOptions;
@@ -89,16 +86,10 @@ typedef struct {
 @property (assign, nonatomic) CGAffineTransform currentSnapshotRotationTransform;
 
 // Views
-@property (strong, nonatomic) UIView *progressContainer;
 @property (strong, nonatomic) UIView *outerContainerForScrollView;
 @property (strong, nonatomic) UIView *snapshotView;
 @property (strong, nonatomic) UIView *blurredSnapshotView;
 @property (strong, nonatomic) UIView *blackBackdrop;
-@property (strong, nonatomic) UIImageView *imageView;
-@property (strong, nonatomic) UIScrollView *scrollView;
-@property (strong, nonatomic) UITextView *textView;
-@property (strong, nonatomic) UIProgressView *progressView;
-@property (strong, nonatomic) UIActivityIndicatorView *spinner;
 
 // Gesture Recognizers
 @property (strong, nonatomic) UITapGestureRecognizer *singleTapperPhoto;
@@ -113,10 +104,6 @@ typedef struct {
 @property (assign, nonatomic) CGPoint imageDragStartingPoint;
 @property (assign, nonatomic) UIOffset imageDragOffsetFromActualTranslation;
 @property (assign, nonatomic) UIOffset imageDragOffsetFromImageCenter;
-
-// Image Downloading
-@property (strong, nonatomic) NSURLSessionDataTask *imageDownloadDataTask;
-@property (strong, nonatomic) NSTimer *downloadProgressTimer;
 
 @end
 
@@ -139,9 +126,6 @@ typedef struct {
         _currentSnapshotRotationTransform = CGAffineTransformIdentity;
         _mode = mode;
         _backgroundOptions = backgroundOptions;
-        if (_mode == JTSImageViewControllerMode_Image) {
-            [self setupImageAndDownloadIfNecessary:imageInfo];
-        }
     }
     return self;
 }
@@ -160,8 +144,6 @@ typedef struct {
         } else {
             [self showImageViewerByExpandingFromOriginalPositionFromViewController:viewController];
         }
-    } else if (self.mode == JTSImageViewControllerMode_AltText) {
-        [self showAltTextFromViewController:viewController];
     }
 }
 
@@ -174,10 +156,7 @@ typedef struct {
     
     _flags.isPresented = NO;
     
-    if (self.mode == JTSImageViewControllerMode_AltText) {
-        [self dismissByExpandingAltTextToOffscreenPosition];
-    }
-    else if (self.mode == JTSImageViewControllerMode_Image) {
+    if (self.mode == JTSImageViewControllerMode_Image) {
         
         if (_flags.imageIsFlickingAwayForDismissal) {
             [self dismissByCleaningUpAfterImageWasFlickedOffscreen];
@@ -188,7 +167,7 @@ typedef struct {
         else {
             BOOL startingRectForThumbnailIsNonZero = (CGRectEqualToRect(CGRectZero, _startingInfo.startingReferenceFrameForThumbnail) == NO);
             BOOL useCollapsingThumbnailStyle = (startingRectForThumbnailIsNonZero
-                                                && self.image != nil
+                                                && self.imageView.image != nil
                                                 && self.transition != JTSImageViewControllerTransition_FromOffscreen);
             if (useCollapsingThumbnailStyle) {
                 [self dismissByCollapsingImageBackToOriginalPosition];
@@ -203,8 +182,6 @@ typedef struct {
 
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self name:UIDeviceOrientationDidChangeNotification object:nil];
-    [_imageDownloadDataTask cancel];
-    [self cancelProgressTimer];
 }
 
 #pragma mark - UIViewController
@@ -284,9 +261,6 @@ typedef struct {
     [super viewDidLoad];
     if (self.mode == JTSImageViewControllerMode_Image) {
         [self viewDidLoadForImageMode];
-    }
-    else if (self.mode == JTSImageViewControllerMode_AltText) {
-        [self viewDidLoadForAltTextMode];
     }
 }
 
@@ -385,42 +359,6 @@ typedef struct {
 
 #pragma mark - Setup
 
-- (void)setupImageAndDownloadIfNecessary:(JTSImageInfo *)imageInfo {
-    if (imageInfo.image) {
-        self.image = imageInfo.image;
-    }
-    else {
-        
-        self.image = imageInfo.placeholderImage;
-        
-        BOOL fromDisk = [imageInfo.imageURL.absoluteString hasPrefix:@"file://"];
-        _flags.imageIsBeingReadFromDisk = fromDisk;
-        
-        typeof(self) __weak weakSelf = self;
-        NSURLSessionDataTask *task = [JTSSimpleImageDownloader downloadImageForURL:imageInfo.imageURL canonicalURL:imageInfo.canonicalImageURL completion:^(UIImage *image) {
-            typeof(self) strongSelf = weakSelf;
-            [strongSelf cancelProgressTimer];
-            if (image) {
-                if (strongSelf.isViewLoaded) {
-                    [strongSelf updateInterfaceWithImage:image];
-                } else {
-                    strongSelf.image = image;
-                }
-            } else if (strongSelf.image == nil) {
-                _flags.imageDownloadFailed = YES;
-                if (_flags.isPresented && _flags.isAnimatingAPresentationOrDismissal == NO) {
-                    [strongSelf dismiss:YES];
-                }
-                // If we're still presenting, at the end of presentation we'll auto dismiss.
-            }
-        }];
-        
-        self.imageDownloadDataTask = task;
-        
-        [self startProgressTimer];
-    }
-}
-
 - (void)viewDidLoadForImageMode {
     
     self.view.backgroundColor = [UIColor blackColor];
@@ -431,31 +369,6 @@ typedef struct {
     self.blackBackdrop.alpha = 0;
     [self.view addSubview:self.blackBackdrop];
     
-    self.scrollView = [[UIScrollView alloc] initWithFrame:self.view.bounds];
-    self.scrollView.delegate = self;
-    self.scrollView.zoomScale = 1.0f;
-    self.scrollView.maximumZoomScale = 8.0f;
-    self.scrollView.scrollEnabled = NO;
-    self.scrollView.isAccessibilityElement = YES;
-    self.scrollView.accessibilityLabel = self.accessibilityLabel;
-    self.scrollView.accessibilityHint = [self accessibilityHintZoomedOut];
-    [self.view addSubview:self.scrollView];
-    
-    CGRect referenceFrameInWindow = [self.imageInfo.referenceView convertRect:self.imageInfo.referenceRect toView:nil];
-    CGRect referenceFrameInMyView = [self.view convertRect:referenceFrameInWindow fromView:nil];
-    
-    self.imageView = [[UIImageView alloc] initWithFrame:referenceFrameInMyView];
-    self.imageView.layer.cornerRadius = self.imageInfo.referenceCornerRadius;
-    self.imageView.contentMode = UIViewContentModeScaleAspectFill;
-    self.imageView.userInteractionEnabled = YES;
-    self.imageView.isAccessibilityElement = NO;
-    self.imageView.clipsToBounds = YES;
-    self.imageView.layer.allowsEdgeAntialiasing = YES;
-    if ([self.optionsDelegate respondsToSelector:@selector(imageViewerShouldFadeThumbnailsDuringPresentationAndDismissal:)]) {
-        if ([self.optionsDelegate imageViewerShouldFadeThumbnailsDuringPresentationAndDismissal:self]) {
-            self.imageView.alpha = 0;
-        }
-    }
     
     // We'll add the image view to either the scroll view
     // or the parent view, based on the transition style
@@ -465,74 +378,11 @@ typedef struct {
     
     [self setupImageModeGestureRecognizers];
     
-    self.progressContainer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 128.0f, 128.0f)];
-    [self.view addSubview:self.progressContainer];
-    self.progressView = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
-    self.progressView.progress = 0;
-    self.progressView.tintColor = [UIColor whiteColor];
-    self.progressView.trackTintColor = [UIColor darkGrayColor];
-    CGRect progressFrame = self.progressView.frame;
-    progressFrame.size.width = 128.0f;
-    self.progressView.frame = progressFrame;
-    self.progressView.center = CGPointMake(64.0f, 64.0f);
-    self.progressView.alpha = 0;
-    [self.progressContainer addSubview:self.progressView];
-    self.spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleWhiteLarge];
-    self.spinner.center = CGPointMake(64.0f, 64.0f);
-    [self.spinner startAnimating];
-    [self.progressContainer addSubview:self.spinner];
-    self.progressContainer.alpha = 0;
-    
     self.animator = [[UIDynamicAnimator alloc] initWithReferenceView:self.scrollView];
     
-    if (self.image) {
-        [self updateInterfaceWithImage:self.image];
+    if (self.imageView.image) {
+        [self updateInterfaceWithImage:self.imageView.image];
     }
-}
-
-- (void)viewDidLoadForAltTextMode {
-    
-    self.view.backgroundColor = [UIColor blackColor];
-    self.view.autoresizingMask = UIViewAutoresizingFlexibleHeight | UIViewAutoresizingFlexibleWidth;
-    
-    self.blackBackdrop = [[UIView alloc] initWithFrame:CGRectInset(self.view.bounds, -512, -512)];
-    self.blackBackdrop.backgroundColor = [UIColor blackColor];
-    self.blackBackdrop.alpha = 0;
-    [self.view addSubview:self.blackBackdrop];
-    
-    CGFloat outerMargin = ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) ? 80.0 : 40.0;
-    
-    self.textView = [[UITextView alloc] initWithFrame:CGRectInset(self.view.bounds, outerMargin, 0)];
-    self.textView.delegate = self;
-    self.textView.textColor = [UIColor whiteColor];
-    self.textView.backgroundColor = [UIColor clearColor];
-    
-    UIFont *font = nil;
-    if ([self.optionsDelegate respondsToSelector:@selector(fontForAltTextInImageViewer:)]) {
-        font = [self.optionsDelegate fontForAltTextInImageViewer:self];
-    }
-    if (font == nil) {
-        font = [UIFont systemFontOfSize:21];
-    }
-    self.textView.font = font;
-    
-    self.textView.text = self.imageInfo.displayableTitleAltTextSummary;
-    
-    UIColor *tintColor = nil;
-    if ([self.optionsDelegate respondsToSelector:@selector(accentColorForAltTextInImageViewer:)]) {
-        tintColor = [self.optionsDelegate accentColorForAltTextInImageViewer:self];
-    }
-    if (tintColor != nil) {
-        self.textView.tintColor = tintColor;
-    }
-    
-    self.textView.textAlignment = NSTextAlignmentCenter;
-    self.textView.autoresizingMask = UIViewAutoresizingFlexibleHeight | UIViewAutoresizingFlexibleWidth;
-    self.textView.editable = NO;
-    self.textView.dataDetectorTypes = UIDataDetectorTypeAll;
-    [self.view addSubview:self.textView];
-    
-    [self setupTextViewTapGestureRecognizer];
 }
 
 - (void)setupImageModeGestureRecognizers {
@@ -559,12 +409,6 @@ typedef struct {
     [self.panRecognizer addTarget:self action:@selector(dismissingPanGestureRecognizerPanned:)];
     self.panRecognizer.delegate = self;
     [self.scrollView addGestureRecognizer:self.panRecognizer];
-}
-
-- (void)setupTextViewTapGestureRecognizer {
-    self.singleTapperText = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(textViewSingleTapped:)];
-    self.singleTapperText.delegate = self;
-    [self.textView addGestureRecognizer:self.singleTapperText];
 }
 
 #pragma mark - Presentation
@@ -599,8 +443,8 @@ typedef struct {
     // the transition finishes.
     [self.view addSubview:self.imageView];
     
-    [viewController presentViewController:self animated:NO completion:^{
-        
+//    [viewController presentViewController:self animated:NO completion:^{
+    
         if ([UIApplication sharedApplication].statusBarOrientation != _startingInfo.startingInterfaceOrientation) {
             _startingInfo.presentingViewControllerPresentedFromItsUnsupportedOrientation = YES;
         }
@@ -708,8 +552,8 @@ typedef struct {
                      }
                      
                      CGRect endFrameForImageView;
-                     if (weakSelf.image) {
-                         endFrameForImageView = [weakSelf resizedFrameForAutorotatingImageView:weakSelf.image.size];
+                     if (weakSelf.imageView.image) {
+                         endFrameForImageView = [weakSelf resizedFrameForAutorotatingImageView:weakSelf.imageView.image.size];
                      } else {
                          endFrameForImageView = [weakSelf resizedFrameForAutorotatingImageView:weakSelf.imageInfo.referenceRect.size];
                      }
@@ -717,10 +561,6 @@ typedef struct {
                      
                      CGPoint endCenterForImageView = CGPointMake(weakSelf.view.bounds.size.width/2.0f, weakSelf.view.bounds.size.height/2.0f);
                      weakSelf.imageView.center = endCenterForImageView;
-                     
-                     if (weakSelf.image == nil) {
-                         weakSelf.progressContainer.alpha = 1.0f;
-                     }
                      
                  } completion:^(BOOL finished) {
                      
@@ -735,15 +575,15 @@ typedef struct {
                      
                      [weakSelf updateScrollViewAndImageViewForCurrentMetrics];
                      
-                     if (_flags.imageDownloadFailed) {
-                         [weakSelf dismiss:YES];
-                     } else {
+//                     if (_flags.imageDownloadFailed) {
+//                         [weakSelf dismiss:YES];
+//                     } else {
                          weakSelf.view.userInteractionEnabled = YES;
-                     }
+//                     }
                  }];
             });
         });
-    }];
+//    }];
 }
 
 - (void)showImageViewerByScalingDownFromOffscreenPositionWithViewController:(UIViewController *)viewController {
@@ -833,123 +673,14 @@ typedef struct {
                  weakSelf.scrollView.alpha = 1.0f;
                  weakSelf.scrollView.transform = CGAffineTransformIdentity;
                  
-                 if (weakSelf.image == nil) {
-                     weakSelf.progressContainer.alpha = 1.0f;
-                 }
-                 
              } completion:^(BOOL finished) {
                  _flags.isTransitioningFromInitialModalToInteractiveState = NO;
                  _flags.isAnimatingAPresentationOrDismissal = NO;
                  weakSelf.view.userInteractionEnabled = YES;
                  _flags.isPresented = YES;
-                 if (_flags.imageDownloadFailed) {
-                     [weakSelf dismiss:YES];
-                 }
-             }];
-        });
-    }];
-}
-
-- (void)showAltTextFromViewController:(UIViewController *)viewController {
-    
-    _flags.isAnimatingAPresentationOrDismissal = YES;
-    self.view.userInteractionEnabled = NO;
-    
-    self.snapshotView = [self snapshotFromParentmostViewController:viewController];
-    
-    if (self.backgroundOptions & JTSImageViewControllerBackgroundOption_Blurred) {
-        self.blurredSnapshotView = [self blurredSnapshotFromParentmostViewController:viewController];
-        [self.snapshotView addSubview:self.blurredSnapshotView];
-        self.blurredSnapshotView.alpha = 0;
-    }
-    
-    [self.view insertSubview:self.snapshotView atIndex:0];
-    _startingInfo.startingInterfaceOrientation = [UIApplication sharedApplication].statusBarOrientation;
-    self.lastUsedOrientation = [UIApplication sharedApplication].statusBarOrientation;
-    CGRect referenceFrameInWindow = [self.imageInfo.referenceView convertRect:self.imageInfo.referenceRect toView:nil];
-    _startingInfo.startingReferenceFrameForThumbnailInPresentingViewControllersOriginalOrientation = [self.view convertRect:referenceFrameInWindow fromView:nil];
-    
-    __weak JTSImageViewController *weakSelf = self;
-    
-    [viewController presentViewController:weakSelf animated:NO completion:^{
-        
-        if ([UIApplication sharedApplication].statusBarOrientation != _startingInfo.startingInterfaceOrientation) {
-            _startingInfo.presentingViewControllerPresentedFromItsUnsupportedOrientation = YES;
-        }
-        
-        // Replace the text view with a snapshot of itself,
-        // to prevent the text from reflowing during the dismissal animation.
-        [weakSelf verticallyCenterTextInTextView];
-        UIView *textViewSnapshot = [weakSelf.textView snapshotViewAfterScreenUpdates:YES];
-        textViewSnapshot.frame = weakSelf.textView.frame;
-        [weakSelf.textView.superview insertSubview:textViewSnapshot aboveSubview:self.textView];
-        weakSelf.textView.hidden = YES;
-        
-        textViewSnapshot.alpha = 0;
-        CGFloat scaling = JTSImageViewController_MaxScalingForExpandingOffscreenStyleTransition;
-        textViewSnapshot.transform = CGAffineTransformMakeScale(scaling, scaling);
-        
-        CGFloat duration = JTSImageViewController_TransitionAnimationDuration;
-        if (USE_DEBUG_SLOW_ANIMATIONS == 1) {
-            duration *= 4;
-        }
-        
-        if ([weakSelf.animationDelegate respondsToSelector:@selector(imageViewerWillBeginPresentation:withContainerView:)]) {
-            [weakSelf.animationDelegate imageViewerWillBeginPresentation:weakSelf withContainerView:weakSelf.view];
-        }
-        
-        // Have to dispatch to the next runloop,
-        // or else the image view changes above won't be
-        // committed prior to the animations below.
-        dispatch_async(dispatch_get_main_queue(), ^{
-            
-            [UIView
-             animateWithDuration:duration
-             delay:0
-             options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionCurveEaseInOut
-             animations:^{
-                 
-                 if ([weakSelf.animationDelegate respondsToSelector:@selector(imageViewerWillAnimatePresentation:withContainerView:duration:)]) {
-                     [weakSelf.animationDelegate imageViewerWillAnimatePresentation:weakSelf withContainerView:weakSelf.view duration:duration];
-                 }
-                 
-                 _flags.isTransitioningFromInitialModalToInteractiveState = YES;
-                 
-                 if ([UIApplication sharedApplication].jts_usesViewControllerBasedStatusBarAppearance) {
-                     [weakSelf setNeedsStatusBarAppearanceUpdate];
-                 } else {
-                     [[UIApplication sharedApplication] setStatusBarHidden:YES withAnimation:UIStatusBarAnimationFade];
-                 }
-                 
-                 CGFloat targetScaling;
-                 if (!(weakSelf.backgroundOptions & JTSImageViewControllerBackgroundOption_Scaled)) {
-                     targetScaling = 1.0;
-                 } else {
-                     targetScaling = JTSImageViewController_MinimumBackgroundScaling;
-                 }
-                 weakSelf.snapshotView.transform = CGAffineTransformConcat(weakSelf.snapshotView.transform, CGAffineTransformMakeScale(targetScaling, targetScaling));
-                 
-                 if (weakSelf.backgroundOptions & JTSImageViewControllerBackgroundOption_Blurred) {
-                     weakSelf.blurredSnapshotView.alpha = 1;
-                 }
-                 
-                 if (weakSelf.backgroundOptions & JTSImageViewControllerBackgroundOption_Scaled) {
-                     [weakSelf addMotionEffectsToSnapshotView];
-                 }
-                 weakSelf.blackBackdrop.alpha = self.alphaForBackgroundDimmingOverlay;
-                 
-                 textViewSnapshot.alpha = 1.0;
-                 textViewSnapshot.transform = CGAffineTransformIdentity;
-                 
-             } completion:^(BOOL finished) {
-                 
-                 [textViewSnapshot removeFromSuperview];
-                 weakSelf.textView.hidden = NO;
-                 
-                 _flags.isTransitioningFromInitialModalToInteractiveState = NO;
-                 _flags.isAnimatingAPresentationOrDismissal = NO;
-                 weakSelf.view.userInteractionEnabled = YES;
-                 _flags.isPresented = YES;
+//                 if (_flags.imageDownloadFailed) {
+//                     [weakSelf dismiss:YES];
+//                 }
              }];
         });
     }];
@@ -1200,60 +931,6 @@ typedef struct {
     }];
 }
 
-- (void)dismissByExpandingAltTextToOffscreenPosition {
-    
-    self.view.userInteractionEnabled = NO;
-    _flags.isAnimatingAPresentationOrDismissal = YES;
-    _flags.isDismissing = YES;
-    
-    __weak JTSImageViewController *weakSelf = self;
-    
-    CGFloat duration = JTSImageViewController_TransitionAnimationDuration;
-    if (USE_DEBUG_SLOW_ANIMATIONS == 1) {
-        duration *= 4;
-    }
-    
-    // Replace the text view with a snapshot of itself,
-    // to prevent the text from reflowing during the dismissal animation.
-    UIView *textViewSnapshot = [self.textView snapshotViewAfterScreenUpdates:YES];
-    textViewSnapshot.frame = self.textView.frame;
-    [self.textView.superview insertSubview:textViewSnapshot aboveSubview:self.textView];
-    [self.textView removeFromSuperview];
-    self.textView.delegate = nil;
-    self.textView = nil;
-    
-    if ([weakSelf.animationDelegate respondsToSelector:@selector(imageViewerWillBeginDismissal:withContainerView:)]) {
-        [weakSelf.animationDelegate imageViewerWillBeginDismissal:weakSelf withContainerView:weakSelf.view];
-    }
-    
-    [UIView animateWithDuration:duration delay:0 options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionCurveEaseInOut animations:^{
-        
-        if ([weakSelf.animationDelegate respondsToSelector:@selector(imageViewerWillAnimateDismissal:withContainerView:duration:)]) {
-            [weakSelf.animationDelegate imageViewerWillAnimateDismissal:weakSelf withContainerView:weakSelf.view duration:duration];
-        }
-        
-        weakSelf.snapshotView.transform = weakSelf.currentSnapshotRotationTransform;
-        [weakSelf removeMotionEffectsFromSnapshotView];
-        weakSelf.blackBackdrop.alpha = 0;
-        textViewSnapshot.alpha = 0;
-        if (weakSelf.backgroundOptions & JTSImageViewControllerBackgroundOption_Blurred) {
-            weakSelf.blurredSnapshotView.alpha = 0;
-        }
-        CGFloat targetScale = JTSImageViewController_MaxScalingForExpandingOffscreenStyleTransition;
-        textViewSnapshot.transform = CGAffineTransformMakeScale(targetScale, targetScale);
-        if ([UIApplication sharedApplication].jts_usesViewControllerBasedStatusBarAppearance) {
-            [weakSelf setNeedsStatusBarAppearanceUpdate];
-        } else {
-            [[UIApplication sharedApplication] setStatusBarHidden:_startingInfo.statusBarHiddenPriorToPresentation
-                                                    withAnimation:UIStatusBarAnimationFade];
-        }
-    } completion:^(BOOL finished) {
-        [weakSelf.presentingViewController dismissViewControllerAnimated:NO completion:^{
-            [weakSelf.dismissalDelegate imageViewerDidDismiss:weakSelf];
-        }];
-    }];
-}
-
 #pragma mark - Snapshots
 
 - (UIView *)snapshotFromParentmostViewController:(UIViewController *)viewController {
@@ -1332,9 +1009,8 @@ typedef struct {
 - (void)updateInterfaceWithImage:(UIImage *)image {
     
     if (image) {
-        self.image = image;
+//        self.image = image;
         self.imageView.image = image;
-        self.progressContainer.alpha = 0;
         
         self.imageView.backgroundColor = [self backgroundColorForImageView];
         
@@ -1349,12 +1025,6 @@ typedef struct {
     
     if (self.mode == JTSImageViewControllerMode_Image) {
         [self updateScrollViewAndImageViewForCurrentMetrics];
-        self.progressContainer.center = CGPointMake(self.view.bounds.size.width/2.0f, self.view.bounds.size.height/2.0f);
-    }
-    else if (self.mode == JTSImageViewControllerMode_AltText) {
-        if (_flags.isTransitioningFromInitialModalToInteractiveState == NO) {
-            [self verticallyCenterTextInTextView];
-        }
     }
     
     CGAffineTransform transform = CGAffineTransformIdentity;
@@ -1467,34 +1137,22 @@ typedef struct {
     BOOL suppressAdjustments = (usingOriginalPositionTransition && _flags.isAnimatingAPresentationOrDismissal);
     
     if (suppressAdjustments == NO) {
-        if (self.image) {
-            self.imageView.frame = [self resizedFrameForAutorotatingImageView:self.image.size];
-        } else {
+//        if (self.image) {
+//            self.imageView.frame = [self resizedFrameForAutorotatingImageView:self.image.size];
+//        } else {
             self.imageView.frame = [self resizedFrameForAutorotatingImageView:self.imageInfo.referenceRect.size];
-        }
+//        }
         self.scrollView.contentSize = self.imageView.frame.size;
         self.scrollView.contentInset = [self contentInsetForScrollView:self.scrollView.zoomScale];
     }
-}
-
-- (void)verticallyCenterTextInTextView {
-    CGRect boundingRect = [self.textView.layoutManager usedRectForTextContainer:self.textView.textContainer];
-    UIEdgeInsets insets = self.textView.contentInset;
-    if (self.view.bounds.size.height > boundingRect.size.height) {
-        insets.top = roundf(self.view.bounds.size.height-boundingRect.size.height)/2.0f;
-    } else {
-        insets.top = 0;
-    }
-    self.textView.contentInset = insets;
-    self.textView.contentOffset = CGPointMake(0, 0 - insets.top);
 }
 
 - (UIEdgeInsets)contentInsetForScrollView:(CGFloat)targetZoomScale {
     UIEdgeInsets inset = UIEdgeInsetsZero;
     CGFloat boundsHeight = self.scrollView.bounds.size.height;
     CGFloat boundsWidth = self.scrollView.bounds.size.width;
-    CGFloat contentHeight = (self.image.size.height > 0) ? self.image.size.height : boundsHeight;
-    CGFloat contentWidth = (self.image.size.width > 0) ? self.image.size.width : boundsWidth;
+    CGFloat contentHeight = (self.imageView.image.size.height > 0) ? self.imageView.image.size.height : boundsHeight;
+    CGFloat contentWidth = (self.imageView.image.size.width > 0) ? self.imageView.image.size.width : boundsWidth;
     CGFloat minContentHeight;
     CGFloat minContentWidth;
     if (contentHeight > contentWidth) {
@@ -1673,7 +1331,7 @@ typedef struct {
         return;
     }
     
-    if (self.image && sender.state == UIGestureRecognizerStateBegan) {
+    if (self.imageView.image && sender.state == UIGestureRecognizerStateBegan) {
         if ([self.interactionsDelegate respondsToSelector:@selector(imageViewerDidLongPress:atRect:)]) {
             CGPoint location = [sender locationInView:self.view];
             [self.interactionsDelegate imageViewerDidLongPress:self atRect:CGRectMake(location.x, location.y, 0.0f, 0.0f)];
@@ -1862,41 +1520,11 @@ typedef struct {
     return (gestureRecognizer == self.singleTapperText);
 }
 
-#pragma mark - Progress Bar
-
-- (void)startProgressTimer {
-    self.downloadProgressTimer = [[NSTimer alloc] initWithFireDate:[NSDate date]
-                                                          interval:0.05
-                                                            target:self
-                                                          selector:@selector(progressTimerFired:)
-                                                          userInfo:nil
-                                                           repeats:YES];
-    [[NSRunLoop mainRunLoop] addTimer:self.downloadProgressTimer forMode:NSRunLoopCommonModes];
-}
-
-- (void)cancelProgressTimer {
-    [self.downloadProgressTimer invalidate];
-    self.downloadProgressTimer = nil;
-}
-
-- (void)progressTimerFired:(NSTimer *)timer {
-    CGFloat progress = 0;
-    CGFloat bytesExpected = self.imageDownloadDataTask.countOfBytesExpectedToReceive;
-    if (bytesExpected > 0 && _flags.imageIsBeingReadFromDisk == NO) {
-        [UIView animateWithDuration:0.25 delay:0 options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionCurveLinear animations:^{
-            self.spinner.alpha = 0;
-            self.progressView.alpha = 1;
-        } completion:nil];
-        progress = self.imageDownloadDataTask.countOfBytesReceived / bytesExpected;
-    }
-    self.progressView.progress = progress;
-}
-
 #pragma mark - UIResponder
 
 - (BOOL)canBecomeFirstResponder {
     
-    if (self.image) {
+    if (self.imageView.image) {
         return YES;
     }
     return NO;
@@ -1904,14 +1532,14 @@ typedef struct {
 
 - (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
     
-    if (self.image && action == @selector(copy:)) {
+    if (self.imageView.image && action == @selector(copy:)) {
         return YES;
     }
     return NO;
 }
 
 - (void)copy:(id)sender {
-    [[UIPasteboard generalPasteboard] setImage:self.image];
+    [[UIPasteboard generalPasteboard] setImage:self.imageView.image];
 }
 
 #pragma mark - Accessibility
